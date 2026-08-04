@@ -1,0 +1,342 @@
+import os
+import discord
+import psycopg2
+import psycopg2.extras
+from typing import Optional
+
+# --- Database Connection ------------------------------------------------------
+
+def get_conn():
+    url = os.environ.get("DATABASE_URL")
+    if not url:
+        raise RuntimeError("DATABASE_URL environment variable is not set.")
+    conn = psycopg2.connect(url, sslmode="require")
+    conn.autocommit = True
+    return conn
+
+def init_db():
+    """Create tables if they don't exist. Called once on bot startup."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS players (
+            user_id     BIGINT PRIMARY KEY,
+            username    TEXT    NOT NULL,
+            elo         INTEGER NOT NULL DEFAULT 0,
+            wins        INTEGER NOT NULL DEFAULT 0,
+            losses      INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS match_history (
+            id              SERIAL PRIMARY KEY,
+            winner_id       BIGINT  NOT NULL,
+            winner_name     TEXT    NOT NULL,
+            loser_id        BIGINT  NOT NULL,
+            loser_name      TEXT    NOT NULL,
+            winner_score    INTEGER NOT NULL,
+            loser_score     INTEGER NOT NULL,
+            points_gained   INTEGER NOT NULL,
+            points_lost     INTEGER NOT NULL,
+            played_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+    cur.close()
+    conn.close()
+
+# --- Rank Definitions ---------------------------------------------------------
+RANKS = [
+    ("Unranked",  0,   0),
+    ("Bronze",    1,   99),
+    ("Silver",    100, 199),
+    ("Gold",      200, 299),
+    ("Platinum",  300, 399),
+    ("Diamond",   400, 499),
+    ("Champion",  500, None),
+]
+
+# Rank floor ELO (minimum ELO to stay in rank). Used by Rank Insurance.
+RANK_FLOORS = {
+    "Unranked": 0,
+    "Bronze":   1,
+    "Silver":   100,
+    "Gold":     200,
+    "Platinum": 300,
+    "Diamond":  400,
+    "Champion": 500,
+}
+
+ALLOWED_OPPONENTS: dict[str, list[str]] = {
+    "Unranked":  ["Unranked", "Bronze"],
+    "Bronze":    ["Unranked", "Bronze", "Silver"],
+    "Silver":    ["Bronze", "Silver", "Gold"],
+    "Gold":      ["Silver", "Gold", "Platinum"],
+    "Platinum":  ["Gold", "Platinum", "Diamond"],
+    "Diamond":   ["Platinum", "Diamond", "Champion"],
+    "Champion":  ["Diamond", "Champion"],
+}
+
+RANK_PING_ROLES: dict[str, list[str]] = {
+    "Unranked":  ["Unranked", "Bronze"],
+    "Bronze":    ["Unranked", "Bronze", "Silver"],
+    "Silver":    ["Bronze", "Silver", "Gold"],
+    "Gold":      ["Silver", "Gold", "Platinum"],
+    "Platinum":  ["Gold", "Platinum", "Diamond"],
+    "Diamond":   ["Platinum", "Diamond", "Champion"],
+    "Champion":  ["Diamond", "Champion"],
+}
+
+# --- ELO Calculation ----------------------------------------------------------
+
+def get_rank_name(elo: int) -> str:
+    for name, low, high in RANKS:
+        if high is None:
+            if elo >= low:
+                return name
+        else:
+            if low <= elo <= high:
+                return name
+    return "Unranked"
+
+def get_rank_index(rank_name: str) -> int:
+    for i, (name, _, _) in enumerate(RANKS):
+        if name == rank_name:
+            return i
+    return 0
+
+def calculate_elo_change(
+    winner_elo: int,
+    loser_elo: int,
+    score: str
+) -> tuple[int, int]:
+    winner_rank = get_rank_name(winner_elo)
+    loser_rank  = get_rank_name(loser_elo)
+    winner_idx  = get_rank_index(winner_rank)
+    loser_idx   = get_rank_index(loser_rank)
+    both_champion = (winner_rank == "Champion" and loser_rank == "Champion")
+
+    if score == "2-0":
+        base_gain = 16
+        base_loss = 16
+    else:
+        base_gain = 12
+        base_loss = 12
+
+    if both_champion:
+        return base_gain, base_loss
+
+    rank_diff = loser_idx - winner_idx
+    if rank_diff == 0:
+        return base_gain, base_loss
+    elif rank_diff > 0:
+        return base_gain + 6, base_loss + 6
+    else:
+        return max(base_gain - 6, 4), max(base_loss - 6, 4)
+
+# --- Player CRUD --------------------------------------------------------------
+
+def _ensure_player(cur, user_id: int, username: str):
+    cur.execute("""
+        INSERT INTO players (user_id, username, elo, wins, losses)
+        VALUES (%s, %s, 0, 0, 0)
+        ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username
+    """, (user_id, username))
+
+def get_player_elo(user_id: int) -> int:
+    conn = get_conn()
+    cur  = conn.cursor()
+    cur.execute("SELECT elo FROM players WHERE user_id = %s", (user_id,))
+    row = cur.fetchone()
+    cur.close(); conn.close()
+    return row[0] if row else 0
+
+def get_player_record(user_id: int) -> dict:
+    conn = get_conn()
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM players WHERE user_id = %s", (user_id,))
+    row = cur.fetchone()
+    cur.close(); conn.close()
+    if row:
+        return dict(row)
+    return {"elo": 0, "wins": 0, "losses": 0, "username": "Unknown"}
+
+def update_player_elo(user_id: int, username: str, elo_delta: int, won: bool) -> int:
+    conn = get_conn()
+    cur  = conn.cursor()
+    _ensure_player(cur, user_id, username)
+    if won:
+        cur.execute("""
+            UPDATE players
+            SET elo = GREATEST(0, elo + %s), wins = wins + 1
+            WHERE user_id = %s
+            RETURNING elo
+        """, (elo_delta, user_id))
+    else:
+        cur.execute("""
+            UPDATE players
+            SET elo = GREATEST(0, elo + %s), losses = losses + 1
+            WHERE user_id = %s
+            RETURNING elo
+        """, (elo_delta, user_id))
+    new_elo = cur.fetchone()[0]
+    cur.close(); conn.close()
+    return new_elo
+
+def update_player_elo_floored(user_id: int, username: str, elo_delta: int, won: bool, floor: int = 0) -> int:
+    """Like update_player_elo but never lets ELO drop below `floor` (for rank insurance)."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    _ensure_player(cur, user_id, username)
+    if won:
+        cur.execute("""
+            UPDATE players
+            SET elo = GREATEST(%s, elo + %s), wins = wins + 1
+            WHERE user_id = %s
+            RETURNING elo
+        """, (max(0, floor), elo_delta, user_id))
+    else:
+        cur.execute("""
+            UPDATE players
+            SET elo = GREATEST(%s, elo + %s), losses = losses + 1
+            WHERE user_id = %s
+            RETURNING elo
+        """, (max(0, floor), elo_delta, user_id))
+    new_elo = cur.fetchone()[0]
+    cur.close(); conn.close()
+    return new_elo
+
+def record_match(
+    winner_id: int, winner_name: str,
+    loser_id: int,  loser_name: str,
+    winner_score: int, loser_score: int,
+    points_gained: int, points_lost: int
+):
+    conn = get_conn()
+    cur  = conn.cursor()
+    cur.execute("""
+        INSERT INTO match_history
+            (winner_id, winner_name, loser_id, loser_name,
+             winner_score, loser_score, points_gained, points_lost)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+    """, (winner_id, winner_name, loser_id, loser_name,
+          winner_score, loser_score, points_gained, points_lost))
+    cur.close(); conn.close()
+
+def get_match_history(user_id: int, limit: int = 10) -> list[dict]:
+    """Returns the last `limit` matches for a player, newest first."""
+    conn = get_conn()
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        SELECT * FROM match_history
+        WHERE winner_id = %s OR loser_id = %s
+        ORDER BY played_at DESC
+        LIMIT %s
+    """, (user_id, user_id, limit))
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.close(); conn.close()
+    return rows
+
+def get_leaderboard() -> list[dict]:
+    conn = get_conn()
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        SELECT user_id, username, elo, wins, losses
+        FROM players
+        ORDER BY elo DESC
+        LIMIT 25
+    """)
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+    result = []
+    for r in rows:
+        d = dict(r)
+        d["rank"] = get_rank_name(d["elo"])
+        result.append(d)
+    return result
+
+def get_leaderboard_rank(user_id: int) -> int:
+    """Returns the 1-based leaderboard position of a player by ELO."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    cur.execute("""
+        SELECT COUNT(*) + 1
+        FROM players
+        WHERE elo > (SELECT COALESCE((SELECT elo FROM players WHERE user_id = %s), 0))
+    """, (user_id,))
+    rank = cur.fetchone()[0]
+    cur.close(); conn.close()
+    return rank
+
+# --- Direct ELO set (for /giveelo) --------------------------------------------
+
+def set_player_elo_direct(user_id: int, username: str, new_elo: int):
+    conn = get_conn()
+    cur  = conn.cursor()
+    _ensure_player(cur, user_id, username)
+    cur.execute("UPDATE players SET elo = %s WHERE user_id = %s", (max(0, new_elo), user_id))
+    cur.close(); conn.close()
+
+def load_elo() -> dict:
+    """Compatibility shim used by /giveelo in bot.py."""
+    conn = get_conn()
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM players")
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+    return {str(r["user_id"]): dict(r) for r in rows}
+
+def save_elo(data: dict):
+    """Compatibility shim: upsert all rows back from /giveelo's dict manipulation."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    for uid, info in data.items():
+        cur.execute("""
+            INSERT INTO players (user_id, username, elo, wins, losses)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (user_id) DO UPDATE
+            SET username = EXCLUDED.username,
+                elo      = EXCLUDED.elo,
+                wins     = EXCLUDED.wins,
+                losses   = EXCLUDED.losses
+        """, (int(uid), info.get("username", "Unknown"),
+              max(0, info.get("elo", 0)),
+              info.get("wins", 0), info.get("losses", 0)))
+    cur.close(); conn.close()
+
+# --- Role Assignment ----------------------------------------------------------
+
+RANK_ROLE_NAMES = [r[0] for r in RANKS]
+
+async def update_rank_role(member: discord.Member, new_elo: int):
+    new_rank = get_rank_name(new_elo)
+    roles_to_remove = []
+    new_role = None
+    for role in member.guild.roles:
+        if role.name in RANK_ROLE_NAMES:
+            if role.name == new_rank:
+                new_role = role
+            elif role in member.roles:
+                roles_to_remove.append(role)
+    try:
+        if roles_to_remove:
+            await member.remove_roles(*roles_to_remove, reason="IFL Rank update")
+        if new_role and new_role not in member.roles:
+            await member.add_roles(new_role, reason=f"IFL Rank update -> {new_rank}")
+    except discord.Forbidden:
+        pass
+
+# --- Matchmaking --------------------------------------------------------------
+
+def can_match(rank_a: str, rank_b: str) -> bool:
+    return rank_b in ALLOWED_OPPONENTS.get(rank_a, [])
+
+# --- Rank Display -------------------------------------------------------------
+
+RANK_DISPLAY = {
+    "Unranked": "Unranked", "Bronze": "Bronze", "Silver": "Silver",
+    "Gold": "Gold", "Platinum": "Platinum", "Diamond": "Diamond",
+    "Champion": "Champion",
+}
+
+def rank_emoji(rank_name: str) -> str:
+    return RANK_DISPLAY.get(rank_name, "Unranked")
